@@ -7,9 +7,15 @@
 #include "netmp.h"
 #include "cmpc_config.h"
 
+constexpr int HNID_BATCH_SIZE = 8;
+constexpr int RECV_BATCH_SIZE = 16;
+constexpr int EVAL_BATCH_SIZE = 16;
+constexpr int GARB_BATCH_SIZE = 4;
+
 using namespace emp;
 template<int nP>
 class FpreMP { public:
+	
 	ThreadPool *pool;
 	int party;
 	NetIOMP<nP> * io;
@@ -77,20 +83,30 @@ class FpreMP { public:
 			if(i == party) {
 				res.push_back(pool->enqueue([this, tKEY, tr, s, length, bucket_size, j]() {
 					prgs[j].random_bool(s[j], length*bucket_size);
-					for(int k = 0; k < length*bucket_size; ++k) {
-						uint8_t data = garble(tKEY[j], tr, s[j], k, j);
-						io->send_data(j, &data, 1);
-						s[j][k] = (s[j][k] != (tr[3*k] and tr[3*k+1]));
+					uint8_t data[GARB_BATCH_SIZE];
+					for(int k = 0; k < length*bucket_size;) {
+						const int current_batch = std::min(GARB_BATCH_SIZE, length * bucket_size - k);
+						// TODO larger batch?
+						garble(tKEY[j], tr, s[j], k, j, current_batch, data);
+						io->send_data(j, &data, current_batch);
+						for(int kk=0;kk<current_batch;++kk)
+							s[j][(k + kk)] = (s[j][(k + kk)] != (tr[3* (k + kk)] and tr[3* (k + kk) +1]));
+						k += current_batch;
 					}
 					io->flush(j);
 				}));
 			} else if (j == party) {
 				res.push_back(pool->enqueue([this, tMAC, tr, s, length, bucket_size, i]() {
-					for(int k = 0; k < length*bucket_size; ++k) {
-						uint8_t data = 0;
-						io->recv_data(i, &data, 1);
-						bool tmp = evaluate(data, tMAC[i], tr, k, i);
-						s[i][k] = (tmp != (tr[3*k] and tr[3*k+1]));
+					for(int k = 0; k < length*bucket_size;) {
+						const int current_batch = std::min(EVAL_BATCH_SIZE, length * bucket_size - k);
+						uint8_t data[EVAL_BATCH_SIZE] = {0};
+						bool outtmp[EVAL_BATCH_SIZE];
+						io->recv_data(i, data, current_batch);
+						// TODO larger batch?
+						evaluate(data, tMAC[i], tr, k, i, current_batch, outtmp);
+						for(int kk=0;kk<current_batch;++kk)
+							s[i][k+kk] = (outtmp[kk] != (tr[3*(k + kk)] and tr[3* (k + kk) +1]));
+						k += current_batch;
 					}
 				}));
 			}
@@ -144,25 +160,16 @@ class FpreMP { public:
 		for(int i = 1; i <= nP; ++i) for(int j = 1; j<= nP; ++j) if( (i < j) and (i == party or j == party) ) {
 			int party2 = i + j - party;
 			res.push_back(pool->enqueue([this, tKEY, tKEYphi, phi, length, bucket_size, party2]() {
-				block bH[2], tmpH[2];
-				for(int k = 0; k < length*bucket_size; ++k) {
-					bH[0] = tKEY[party2][3*k];
-					bH[1] = bH[0] ^ Delta;
-					HnID(prps+party2, bH, bH, 2*k, 2, tmpH);
-					tKEYphi[party2][k] = bH[0];
-					bH[1] = bH[0] ^ bH[1];
-					bH[1] = phi[k] ^ bH[1];
-					io->send_data(party2, &bH[1], sizeof(block));
+				// TODO use larger batches here
+				for(int k = 0; k < length*bucket_size;) {
+					HnIDProcess(tKEY, tKEYphi, phi, length * bucket_size, party2, k);
 				}
 				io->flush(party2);
 			}));
 			res.push_back(pool->enqueue([this, tMAC, tMACphi, tr, length, bucket_size, party2]() {
-				block bH;
-				for(int k = 0; k < length*bucket_size; ++k) {
-					io->recv_data(party2, &bH, sizeof(block));
-					block hin = sigma(tMAC[party2][3*k]) ^ makeBlock(0, 2*k+tr[3*k]);
-					tMACphi[party2][k] = prps2[party2].H(hin);
-					if(tr[3*k])tMACphi[party2][k] = tMACphi[party2][k] ^ bH;
+				// TODO use larger batches here (with H template variant)
+				for(int k = 0; k < length*bucket_size;) {
+					RecvProcess(tMAC, tMACphi, tr, length* bucket_size, party2,k);
 				}
 			}));
 		}
@@ -324,41 +331,57 @@ class FpreMP { public:
 	}
 
 	//TODO: change to justGarble
-	uint8_t garble(block * KEY, bool * r, bool * r2, int i, int I) {
-		uint8_t data = 0;
-		block tmp[4], tmp2[4], tmpH[4];
-		tmp[0] = KEY[3*i];
-		tmp[1] = tmp[0] ^ Delta;
-		tmp[2] = KEY[3*i+1];
-		tmp[3] = tmp[2] ^ Delta;
-		HnID(prps+I, tmp, tmp, 4*i, 4, tmpH);
+	void garble(block * KEY, bool * r, bool * r2, int i, int I, int batch_size, uint8_t* data) {
+		block tmp[GARB_BATCH_SIZE][4];
+		block tmpH[GARB_BATCH_SIZE][4];
+		for (int ii = 0; ii < batch_size; ++ii) {
+			tmp[ii][0] = KEY[3 * (ii+i)];
+			tmp[ii][1] = tmp[ii][0] ^ Delta;
+			tmp[ii][2] = KEY[3 * (ii + i) + 1];
+			tmp[ii][3] = tmp[ii][2] ^ Delta;
+		}
+		HnID(prps+I, (block*) tmp, (block*)tmp, 4*i, 4*batch_size, (block*)tmpH);
 
-		tmp2[0] = tmp[0] ^ tmp[2];
-		tmp2[1] = tmp[1] ^ tmp[2];
-		tmp2[2] = tmp[0] ^ tmp[3];
-		tmp2[3] = tmp[1] ^ tmp[3];
+		for (int ii = 0; ii < batch_size; ++ii) {
+			block tmp2[4];
+			tmp2[0] = tmp[ii][0] ^ tmp[ii][2];
+			tmp2[1] = tmp[ii][1] ^ tmp[ii][2];
+			tmp2[2] = tmp[ii][0] ^ tmp[ii][3];
+			tmp2[3] = tmp[ii][1] ^ tmp[ii][3];
 
-		data = LSB(tmp2[0]);
-		data |= (LSB(tmp2[1])<<1);
-		data |= (LSB(tmp2[2])<<2);
-		data |= (LSB(tmp2[3])<<3);
-		if ( ((false != r[3*i] ) && (false != r[3*i+1])) != r2[i] )
-			data= data ^ 0x1;
-		if ( ((true != r[3*i] ) && (false != r[3*i+1])) != r2[i] )
-			data = data ^ 0x2;
-		if ( ((false != r[3*i] ) && (true != r[3*i+1])) != r2[i] )
-			data = data ^ 0x4;
-		if ( ((true != r[3*i] ) && (true != r[3*i+1])) != r2[i] )
-			data = data ^ 0x8;
-		return data;
+			uint8_t ldata = 0;
+			ldata = LSB(tmp2[0]);
+			ldata |= (LSB(tmp2[1]) << 1);
+			ldata |= (LSB(tmp2[2]) << 2);
+			ldata |= (LSB(tmp2[3]) << 3);
+			if (((false != r[3 * (i+ii)]) && (false != r[3 * (i + ii) + 1])) != r2[(i + ii)])
+				ldata = ldata ^ 0x1;
+			if (((true != r[3 * (i + ii)]) && (false != r[3 * (i + ii) + 1])) != r2[(i + ii)])
+				ldata = ldata ^ 0x2;
+			if (((false != r[3 * (i + ii)]) && (true != r[3 * (i + ii) + 1])) != r2[(i + ii)])
+				ldata = ldata ^ 0x4;
+			if (((true != r[3 * (i + ii)]) && (true != r[3 * (i + ii) + 1])) != r2[(i + ii)])
+				ldata = ldata ^ 0x8;
+			data[ii] = ldata;
+		}
 	}
-	bool evaluate(uint8_t tmp, block * MAC, bool * r, int i, int I) {
-		block hin = sigma(MAC[3*i]) ^ makeBlock(0, 4*i + r[3*i]);
-		block hin2 = sigma(MAC[3*i+1]) ^ makeBlock(0, 4*i + 2 + r[3*i+1]);
-		block bH = prps[I].H(hin) ^ prps[I].H(hin2);
-		uint8_t res = LSB(bH);
-		tmp >>= (r[3*i+1]*2+r[3*i]);
-		return (tmp&0x1) != (res&0x1);
+	void evaluate(uint8_t tmp[EVAL_BATCH_SIZE], block * MAC, bool * r, int i, int I, int batch_size, bool outtmp[EVAL_BATCH_SIZE]) {
+		block hin[EVAL_BATCH_SIZE], hin2[EVAL_BATCH_SIZE];
+		for (int ii = 0; ii < batch_size; ++ii) {
+			hin[ii] = sigma(MAC[3 * (i + ii)]) ^ makeBlock(0, 4 * (i+ii) + r[3 * (i + ii)]);
+			hin2[ii] = sigma(MAC[3 * (i + ii) + 1]) ^ makeBlock(0, 4 * (i + ii) + 2 + r[3 * (i + ii) + 1]);
+		}
+		
+		prps[I].H<EVAL_BATCH_SIZE>(hin, hin);
+		prps[I].H<EVAL_BATCH_SIZE>(hin2, hin2);
+
+		for (int ii = 0; ii < batch_size; ++ii) {
+			block hB = hin[ii] ^ hin2[ii];
+			uint8_t res = LSB(hB);
+			uint8_t ltmp = tmp[ii];
+			ltmp >>= (r[3 * (i + ii) + 1] * 2 + r[3 * (i + ii)]);
+			outtmp[ii] = (ltmp & 0x1) != (res & 0x1);
+		}
 	}	
 
 	void check_MAC_phi(block * MAC[nP+1], block * KEY[nP+1], block * phi, bool * r, int length) {
@@ -424,5 +447,42 @@ class FpreMP { public:
 			scratch = nullptr;
 		}
 	}
+
+	void HnIDProcess(block* const tKEY[nP+1], block* const tKEYphi[nP + 1], block* phi, int total_iterations, int party2, int& k) {
+		const int current_batch = std::min(total_iterations - k, HNID_BATCH_SIZE);
+		block bH[HNID_BATCH_SIZE][2], tmpH[HNID_BATCH_SIZE][2];
+		for (int kk = 0; kk < current_batch; ++kk) {
+			bH[kk][0] = tKEY[party2][3 * (k + kk)];
+			bH[kk][1] = bH[kk][0] ^ Delta;
+		}
+
+		HnID(prps + party2, (block*)bH, (block*)bH, 2 * k, 2* current_batch, (block*)tmpH);
+
+		for (int kk = 0; kk < current_batch; ++kk) {
+			tKEYphi[party2][k+kk] = bH[kk][0];
+			bH[kk][1] = bH[kk][0] ^ bH[kk][1];
+			bH[kk][1] = phi[k + kk] ^ bH[kk][1];
+			io->send_data(party2, &bH[kk][1], sizeof(block));
+		}
+		k += current_batch;
+	}
+
+	void RecvProcess(block* const tMAC[nP + 1], block* const tMACphi[nP + 1], bool* tr, int total_iterations, int party2, int& k) {
+		const int current_batch = std::min(total_iterations - k, RECV_BATCH_SIZE);
+		block bH[RECV_BATCH_SIZE], hin[RECV_BATCH_SIZE];
+		io->recv_data(party2, bH, current_batch * sizeof(block));
+		for (int kk = 0; kk < current_batch; ++kk) {
+			hin[kk] = sigma(tMAC[party2][3 * (kk + k)]) ^ makeBlock(0, 2 * (kk + k) + tr[3 * (kk + k)]);
+		}
+		prps2[party2].H<RECV_BATCH_SIZE>(hin, hin);
+		for(int kk = 0; kk < current_batch; ++kk) {
+			tMACphi[party2][kk+k] = hin[kk];
+			if (tr[3 * (kk+k)])tMACphi[party2][(kk + k)] = tMACphi[party2][(kk + k)] ^ bH[kk];
+		}
+		
+		k += current_batch;
+	}
+
+
 };
 #endif// FPRE_H__

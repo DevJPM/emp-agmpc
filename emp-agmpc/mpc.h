@@ -8,6 +8,8 @@ using namespace emp;
 
 template<int nP>
 class CMPC { public:
+	static constexpr size_t GARBLING_BATCH_SIZE = 2;
+	static constexpr size_t ONLINE_BATCH_SIZE = 4;
 	const static int SSP = 5;//5*8 in fact...
 	const block MASK = makeBlock(0x0ULL, 0xFFFFFULL);
 	FpreMP<nP>* fpre = nullptr;
@@ -249,43 +251,21 @@ ret.get();
 #endif
 
 		ands = 0;
-		block H[4][nP+1];
-		block K[4][nP+1], M[4][nP+1];
+		//block H[4][nP + 1];
+		block K[4][nP + 1], M[4][nP + 1];
 		bool r[4];
+		int indices[GARBLING_BATCH_SIZE];
+		size_t num_batched_indices=0;
 		if(party != 1) { 
-			for(int i = 0; i < cf->num_gate; ++i) if(cf->gates[4*i+3] == AND_GATE) {
-				r[0] = sigma_value[ands] != value[cf->gates[4*i+2]];
-				r[1] = r[0] != value[cf->gates[4*i]];
-				r[2] = r[0] != value[cf->gates[4*i+1]];
-				r[3] = r[1] != value[cf->gates[4*i+1]];
-
-				for(int j = 1; j <= nP; ++j) {
-					M[0][j] = sigma_mac[j][ands] ^ mac[j][cf->gates[4*i+2]];
-					M[1][j] = M[0][j] ^ mac[j][cf->gates[4*i]];
-					M[2][j] = M[0][j] ^ mac[j][cf->gates[4*i+1]];
-					M[3][j] = M[1][j] ^ mac[j][cf->gates[4*i+1]];
-
-					K[0][j] = sigma_key[j][ands] ^ key[j][cf->gates[4*i+2]];
-					K[1][j] = K[0][j] ^ key[j][cf->gates[4*i]];
-					K[2][j] = K[0][j] ^ key[j][cf->gates[4*i+1]];
-					K[3][j] = K[1][j] ^ key[j][cf->gates[4*i+1]];
+			for (int i = 0; i < cf->num_gate; ++i) if (cf->gates[4 * i + 3] == AND_GATE) {
+				indices[num_batched_indices] = i;
+				num_batched_indices++;
+				if (num_batched_indices == GARBLING_BATCH_SIZE) {
+					GarbleGates(indices, num_batched_indices, ands);
+					num_batched_indices = 0;
 				}
-				K[3][1] = K[3][1] ^ Delta;
-
-				Hash(H, labels[cf->gates[4*i]], labels[cf->gates[4*i+1]], ands);
-				for(int j = 0; j < 4; ++j) {
-					for(int k = 1; k <= nP; ++k) if(k != party) {
-						H[j][k] = H[j][k] ^ M[j][k];
-						H[j][party] = H[j][party] ^ K[j][k];
-					}
-					H[j][party] = H[j][party] ^ labels[cf->gates[4*i+2]];
-					if(r[j]) 
-						H[j][party] = H[j][party] ^ Delta;
-				}
-				for(int j = 0; j < 4; ++j)
-					io->send_data(1, H[j]+1, sizeof(block)*(nP));
-				++ands;
 			}
+			GarbleGates(indices, num_batched_indices,ands);
 			io->flush(1);
 		} else {
 			for(int i = 2; i <= nP; ++i) {
@@ -378,39 +358,41 @@ ret.get();
 			joinNclean(res);
 	
 			int ands = 0;	
+			int queued_indices[ONLINE_BATCH_SIZE];
+			int queued_gate_ids[ONLINE_BATCH_SIZE];
+			size_t queue_size = 0;
 			for(int i = 0; i < cf->num_gate; ++i) {
+				bool trap = queue_size == ONLINE_BATCH_SIZE;
+				int left_in = cf->gates[4 * i];
+				for (size_t t = 0; t < queue_size; ++t)
+					if (left_in == queued_gate_ids[t])
+						trap = true;
+				if (cf->gates[4 * i + 3] == XOR_GATE || cf->gates[4 * i + 3] == AND_GATE) {
+					int right_in = cf->gates[4 * i + 1];
+					for (size_t t = 0; t < queue_size; ++t)
+						if (right_in == queued_gate_ids[t])
+							trap = true;
+				}
+				if (trap) {
+					EvaluateANDGates(mask_input, queued_indices, queue_size, ands);
+					queue_size = 0;
+				}
+
 				if (cf->gates[4*i+3] == XOR_GATE) {
 					for(int j = 2; j<= nP; ++j)
 						eval_labels[j][cf->gates[4*i+2]] = eval_labels[j][cf->gates[4*i]] ^ eval_labels[j][cf->gates[4*i+1]];
 					mask_input[cf->gates[4*i+2]] = mask_input[cf->gates[4*i]] != mask_input[cf->gates[4*i+1]];
 				} else if (cf->gates[4*i+3] == AND_GATE) {
-					int index = 2*mask_input[cf->gates[4*i]] + mask_input[cf->gates[4*i+1]];
-					block H[nP+1];
-					for(int j = 2; j <= nP; ++j)
-						eval_labels[j][cf->gates[4*i+2]] = GTM[ands][index][j];
-					mask_input[cf->gates[4*i+2]] = GTv[ands][index];
-					for(int j = 2; j <= nP; ++j) {
-						Hash(H, eval_labels[j][cf->gates[4*i]], eval_labels[j][cf->gates[4*i+1]], ands, index);
-						xorBlocks_arr(H, H, GT[ands][j][index], nP+1);
-						for(int k = 2; k <= nP; ++k)
-							eval_labels[k][cf->gates[4*i+2]] = H[k] ^ eval_labels[k][cf->gates[4*i+2]];
-					
-						block t0 = GTK[ands][index][j] ^ Delta;
-
-						if(cmpBlock(&H[1], &GTK[ands][index][j], 1))
-							mask_input[cf->gates[4*i+2]] = mask_input[cf->gates[4*i+2]] != false;
-						else if(cmpBlock(&H[1], &t0, 1))
-							mask_input[cf->gates[4*i+2]] = mask_input[cf->gates[4*i+2]] != true;
-						else 	{cout <<ands <<"no match GT!"<<endl<<flush;
-						}
-					}
-					ands++;
+					queued_indices[queue_size] = i;
+					queued_gate_ids[queue_size] = cf->gates[4 * i + 2];
+					queue_size++;
 				} else {
 					mask_input[cf->gates[4*i+2]] = not mask_input[cf->gates[4*i]];	
 					for(int j = 2; j <= nP; ++j)
 						eval_labels[j][cf->gates[4*i+2]] = eval_labels[j][cf->gates[4*i]];
 				}
 			}
+			EvaluateANDGates(mask_input, queued_indices, queue_size, ands);
 		}
 		if(party != 1) {
 			io->send_data(1, value+cf->num_wire - cf->n3, cf->n3);
@@ -438,31 +420,64 @@ ret.get();
 		}
 		delete[] mask_input;
 	}
-	void Hash(block H[4][nP+1], const block & a, const block & b, uint64_t idx) {
-		block T[4];
-		T[0] = sigma(a);
-		T[1] = sigma(a ^ Delta);
-		T[2] = sigma(sigma(b));
-		T[3] = sigma(sigma(b ^ Delta));
-		
-		H[0][0] = T[0] ^ T[2];  
-		H[1][0] = T[0] ^ T[3];  
-		H[2][0] = T[1] ^ T[2];  
-		H[3][0] = T[1] ^ T[3];  
-		for(int j = 0; j < 4; ++j) for(int i = 1; i <= nP; ++i) {
-			H[j][i] = H[j][0] ^ makeBlock(4*idx+j, i);
+
+	__attribute__((always_inline))
+	void Hash(block H[GARBLING_BATCH_SIZE][4][nP + 1], const int left[GARBLING_BATCH_SIZE], const int right[GARBLING_BATCH_SIZE], uint64_t idx, size_t num_gates) {
+		block HB[GARBLING_BATCH_SIZE][4];
+		for (size_t ii = 0; ii < num_gates; ++ii) {
+			const block a = labels[left[ii]];
+			const block b = labels[right[ii]];
+			block T[4];
+			T[0] = sigma(a);
+			T[1] = sigma(a ^ Delta);
+			T[2] = sigma(sigma(b));
+			T[3] = sigma(sigma(b ^ Delta));
+
+			H[ii][0][0] = T[0] ^ T[2];
+			H[ii][1][0] = T[0] ^ T[3];
+			H[ii][2][0] = T[1] ^ T[2];
+			H[ii][3][0] = T[1] ^ T[3];
+			for (int j = 0; j < 4; ++j) {
+				HB[ii][j] = H[ii][j][0];
+				for (int i = 1; i <= nP; ++i) {
+					H[ii][j][i] = H[ii][j][0] ^ makeBlock(4 * idx + j, i);
+				}
+			}
+			++idx;
 		}
-		for(int j = 0; j < 4; ++j) {
-			prp.permute_block(H[j]+1, nP);
+		
+		// while we encrypt 4*num_gates blocks too many
+		// we still think this is worth it due to the fact
+		// that otherwise we'd be stuck with 4*num_gates calls to batches of 3 blocks
+		prp.permute_block((block*)H, (nP+1)*4*num_gates);
+
+		for (size_t ii = 0; ii < num_gates; ++ii) {
+			for (size_t j = 0; j < 4; ++j)
+				H[ii][j][0] = HB[ii][j];
 		}
 	}
 
-	void Hash(block H[nP+1], const block &a, const block& b, uint64_t idx, uint64_t row) {
-		H[0] = sigma(a) ^ sigma(sigma(b));
-		for(int i = 1; i <= nP; ++i) {
-			H[i] = H[0] ^ makeBlock(4*idx+row, i);
+	__attribute__((always_inline))
+	void Hash(block H[ONLINE_BATCH_SIZE][nP-1][nP+1], const int left[ONLINE_BATCH_SIZE], const int right[ONLINE_BATCH_SIZE], uint64_t idx, int row[ONLINE_BATCH_SIZE], size_t num_gates) {
+		block HB[ONLINE_BATCH_SIZE][nP - 1];
+		for (size_t ii = 0; ii < num_gates; ++ii) {
+			for (int j = 2; j <= nP; ++j) {
+				H[ii][j-2][0] = sigma(eval_labels[j][left[ii]]) ^ sigma(sigma(eval_labels[j][right[ii]]));
+				HB[ii][j - 2] = H[ii][j - 2][0];
+				for (int i = 1; i <= nP; ++i) {
+					H[ii][j-2][i] = H[ii][j-2][0] ^ makeBlock(4 * idx + static_cast<uint64_t>(row[ii]), i);
+				}
+			}
+			++idx;
 		}
-		prp.permute_block(H+1, nP);
+		
+		prp.permute_block((block*)H, (nP+1)*(nP-1)*num_gates);
+
+		for (size_t ii = 0; ii < num_gates; ++ii) {
+			for (int j = 2; j <= nP; ++j) {
+				H[ii][j - 2][0] = HB[ii][j - 2];
+			}
+		}
 	}
 
 	string tostring(bool a) {
@@ -551,39 +566,43 @@ ret.get();
 			joinNclean(res);
 	
 			int ands = 0;	
-			for(int i = 0; i < cf->num_gate; ++i) {
-				if (cf->gates[4*i+3] == XOR_GATE) {
-					for(int j = 2; j<= nP; ++j)
-						eval_labels[j][cf->gates[4*i+2]] = eval_labels[j][cf->gates[4*i]] ^ eval_labels[j][cf->gates[4*i+1]];
-					mask_input[cf->gates[4*i+2]] = mask_input[cf->gates[4*i]] != mask_input[cf->gates[4*i+1]];
-				} else if (cf->gates[4*i+3] == AND_GATE) {
-					int index = 2*mask_input[cf->gates[4*i]] + mask_input[cf->gates[4*i+1]];
-					block H[nP+1];
-					for(int j = 2; j <= nP; ++j)
-						eval_labels[j][cf->gates[4*i+2]] = GTM[ands][index][j];
-					mask_input[cf->gates[4*i+2]] = GTv[ands][index];
-					for(int j = 2; j <= nP; ++j) {
-						Hash(H, eval_labels[j][cf->gates[4*i]], eval_labels[j][cf->gates[4*i+1]], ands, index);
-						xorBlocks_arr(H, H, GT[ands][j][index], nP+1);
-						for(int k = 2; k <= nP; ++k)
-							eval_labels[k][cf->gates[4*i+2]] = H[k] ^ eval_labels[k][cf->gates[4*i+2]];
-					
-						block t0 = GTK[ands][index][j] ^ Delta;
+			int queued_indices[ONLINE_BATCH_SIZE];
+			int queued_gate_ids[ONLINE_BATCH_SIZE];
+			size_t queue_size = 0;
+			for (int i = 0; i < cf->num_gate; ++i) {
+				bool trap = queue_size == ONLINE_BATCH_SIZE;
+				int left_in = cf->gates[4 * i];
+				for (size_t t = 0; t < queue_size; ++t)
+					if (left_in == queued_gate_ids[t])
+						trap = true;
+				if (cf->gates[4 * i + 3] == XOR_GATE || cf->gates[4 * i + 3] == AND_GATE) {
+					int right_in = cf->gates[4 * i + 1];
+					for (size_t t = 0; t < queue_size; ++t)
+						if (right_in == queued_gate_ids[t])
+							trap = true;
+				}
+				if (trap) {
+					EvaluateANDGates(mask_input, queued_indices, queue_size, ands);
+					queue_size = 0;
+				}
 
-						if(cmpBlock(&H[1], &GTK[ands][index][j], 1))
-							mask_input[cf->gates[4*i+2]] = mask_input[cf->gates[4*i+2]] != false;
-						else if(cmpBlock(&H[1], &t0, 1))
-							mask_input[cf->gates[4*i+2]] = mask_input[cf->gates[4*i+2]] != true;
-						else 	{cout <<ands <<"no match GT!"<<endl<<flush;
-						}
-					}
-					ands++;
-				} else {
-					mask_input[cf->gates[4*i+2]] = not mask_input[cf->gates[4*i]];	
-					for(int j = 2; j <= nP; ++j)
-						eval_labels[j][cf->gates[4*i+2]] = eval_labels[j][cf->gates[4*i]];
+				if (cf->gates[4 * i + 3] == XOR_GATE) {
+					for (int j = 2; j <= nP; ++j)
+						eval_labels[j][cf->gates[4 * i + 2]] = eval_labels[j][cf->gates[4 * i]] ^ eval_labels[j][cf->gates[4 * i + 1]];
+					mask_input[cf->gates[4 * i + 2]] = mask_input[cf->gates[4 * i]] != mask_input[cf->gates[4 * i + 1]];
+				}
+				else if (cf->gates[4 * i + 3] == AND_GATE) {
+					queued_indices[queue_size] = i;
+					queued_gate_ids[queue_size] = cf->gates[4 * i + 2];
+					queue_size++;
+				}
+				else {
+					mask_input[cf->gates[4 * i + 2]] = not mask_input[cf->gates[4 * i]];
+					for (int j = 2; j <= nP; ++j)
+						eval_labels[j][cf->gates[4 * i + 2]] = eval_labels[j][cf->gates[4 * i]];
 				}
 			}
+			EvaluateANDGates(mask_input, queued_indices, queue_size, ands);
 		}
 		if(party != 1) {
 			io->send_data(1, value+cf->num_wire - cf->n3, cf->n3);
@@ -612,5 +631,102 @@ ret.get();
 		delete[] mask_input;
 	}
 
+	__attribute__((always_inline))
+	void GarbleGates(int indices[GARBLING_BATCH_SIZE], size_t num_gates, int& ands) {
+		block H[GARBLING_BATCH_SIZE][4][nP + 1];
+		block K[GARBLING_BATCH_SIZE][4][nP + 1], M[GARBLING_BATCH_SIZE][4][nP + 1];
+		bool r[GARBLING_BATCH_SIZE][4];
+		int left[GARBLING_BATCH_SIZE], right[GARBLING_BATCH_SIZE];
+
+		int original_ands = ands;
+
+		for (size_t ii = 0; ii < num_gates; ++ii) {
+			int i = indices[ii];
+			left[ii] = cf->gates[4 * i];
+			right[ii] = cf->gates[4 * i + 1];
+			r[ii][0] = sigma_value[ands] != value[cf->gates[4 * i + 2]];
+			r[ii][1] = r[ii][0] != value[cf->gates[4 * i]];
+			r[ii][2] = r[ii][0] != value[cf->gates[4 * i + 1]];
+			r[ii][3] = r[ii][1] != value[cf->gates[4 * i + 1]];
+
+			for (int j = 1; j <= nP; ++j) {
+				M[ii][0][j] = sigma_mac[j][ands] ^ mac[j][cf->gates[4 * i + 2]];
+				M[ii][1][j] = M[ii][0][j] ^ mac[j][cf->gates[4 * i]];
+				M[ii][2][j] = M[ii][0][j] ^ mac[j][cf->gates[4 * i + 1]];
+				M[ii][3][j] = M[ii][1][j] ^ mac[j][cf->gates[4 * i + 1]];
+
+				K[ii][0][j] = sigma_key[j][ands] ^ key[j][cf->gates[4 * i + 2]];
+				K[ii][1][j] = K[ii][0][j] ^ key[j][cf->gates[4 * i]];
+				K[ii][2][j] = K[ii][0][j] ^ key[j][cf->gates[4 * i + 1]];
+				K[ii][3][j] = K[ii][1][j] ^ key[j][cf->gates[4 * i + 1]];
+			}
+			K[ii][3][1] = K[ii][3][1] ^ Delta;
+			//HashOLD(H[ii], labels[cf->gates[4 * i]], labels[cf->gates[4 * i + 1]], ands);
+			ands++;
+		}
+
+		ands = original_ands;
+
+		Hash(H, left, right, ands, num_gates);
+
+		for (size_t ii = 0; ii < num_gates; ++ii) {
+			int i = indices[ii];
+			for (int j = 0; j < 4; ++j) {
+				for (int k = 1; k <= nP; ++k) if (k != party) {
+					H[ii][j][k] = H[ii][j][k] ^ M[ii][j][k];
+					H[ii][j][party] = H[ii][j][party] ^ K[ii][j][k];
+				}
+				H[ii][j][party] = H[ii][j][party] ^ labels[cf->gates[4 * i + 2]];
+				if (r[ii][j])
+					H[ii][j][party] = H[ii][j][party] ^ Delta;
+			}
+			for (int j = 0; j < 4; ++j)
+				io->send_data(1, H[ii][j] + 1, sizeof(block) * (nP));
+			++ands;
+		}
+	}
+
+	__attribute__((always_inline))
+	void EvaluateANDGates(bool* mask_input,int queued_indices[ONLINE_BATCH_SIZE], size_t queue_size, int& ands) {
+		int index[ONLINE_BATCH_SIZE];
+		block H[ONLINE_BATCH_SIZE][nP - 1][nP + 1];
+		int left[ONLINE_BATCH_SIZE], right[ONLINE_BATCH_SIZE];
+		int input_ands = ands;
+		for (size_t ii = 0; ii < queue_size; ++ii) {
+			int i = queued_indices[ii];
+			left[ii] = cf->gates[4 * i];
+			right[ii] = cf->gates[4 * i + 1];
+			index[ii] = 2 * mask_input[cf->gates[4 * i]] + mask_input[cf->gates[4 * i + 1]];
+
+			for (int j = 2; j <= nP; ++j)
+				eval_labels[j][cf->gates[4 * i + 2]] = GTM[ands][index[ii]][j];
+			mask_input[cf->gates[4 * i + 2]] = GTv[ands][index[ii]];
+			++ands;
+		}
+		ands = input_ands;
+		Hash(H, left, right, ands, index, queue_size);
+		for (size_t ii = 0; ii < queue_size; ++ii) {
+			int i = queued_indices[ii];
+			for (int j = 2; j <= nP; ++j) {
+				// TODO Dynamic Batching?
+				//Hash(H, eval_labels[j][cf->gates[4 * i]], eval_labels[j][cf->gates[4 * i + 1]], ands, index[ii]);
+				xorBlocks_arr(H[ii][j-2], H[ii][j - 2], GT[ands][j][index[ii]], nP + 1);
+				for (int k = 2; k <= nP; ++k)
+					eval_labels[k][cf->gates[4 * i + 2]] = H[ii][j - 2][k] ^ eval_labels[k][cf->gates[4 * i + 2]];
+
+				block t0 = GTK[ands][index[ii]][j] ^ Delta;
+
+				if (cmpBlock(&H[ii][j - 2][1], &GTK[ands][index[ii]][j], 1))
+					mask_input[cf->gates[4 * i + 2]] = mask_input[cf->gates[4 * i + 2]] != false;
+				else if (cmpBlock(&H[ii][j - 2][1], &t0, 1))
+					mask_input[cf->gates[4 * i + 2]] = mask_input[cf->gates[4 * i + 2]] != true;
+				else {
+					cout << ands << "no match GT!" << endl << flush;
+				}
+			}
+			ands++;
+		}
+		
+	}
 };
 #endif// CMPC_H__

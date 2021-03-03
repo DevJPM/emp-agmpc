@@ -2,6 +2,9 @@ cmake_minimum_required (VERSION 2.8.11)
 project (emp-agmpc)
 set(NAME "emp-agmpc")
 
+string(APPEND CMAKE_CXX_FLAGS " -g -mvaes -mavx512f")
+string(APPEND CMAKE_LINKER_FLAGS " -g -mvaes -mavx512f")
+
 find_path(CMAKE_FOLDER NAMES cmake/emp-tool-config.cmake)
 
 include(${CMAKE_FOLDER}/cmake/common.cmake)
